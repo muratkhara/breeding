@@ -1,13 +1,14 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { QuickDB } = require('quick.db');
-const db = new QuickDB();
+
+// Basit veritabanı: sadece RAM'de tutar ama Pella ücretsiz planda restart atmadığı için sorun olmaz
+const bahceler = new Map(); // userId => {seviye: 0/1, plantTime: number, coin: number}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-const activeSeeds = new Map(); // geçici tohum teklifleri
+const activeSeeds = new Map();
 
 client.once('ready', async () => {
   console.log(`${client.user.tag} hazır! 🌱 Tohum oyunu aktif!`);
@@ -16,92 +17,78 @@ client.once('ready', async () => {
     new SlashCommandBuilder()
       .setName('tohum')
       .setDescription('Birine tohum gönder!')
-      .addUserOption(option => option.setName('kullanici').setDescription('Kişi').setRequired(true)),
+      .addUserOption(o => o.setName('kullanici').setDescription('Kişi').setRequired(true)),
     new SlashCommandBuilder().setName('bahce').setDescription('Bahçeni kontrol et'),
     new SlashCommandBuilder().setName('hasat').setDescription('1 hafta dolduysa hasat et (+100 coin)')
   ].map(c => c.toJSON());
 
   await client.application.commands.set(commands);
-  console.log('Komutlar yüklendi!');
 });
 
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand() && !interaction.isButton()) return;
+client.on('interactionCreate', async i => {
+  if (!i.isChatInputCommand() && !i.isButton()) return;
 
-  // TOHUM GÖNDER
-  if (interaction.commandName === 'tohum') {
-    const target = interaction.options.getUser('kullanici');
-    if (target.id === interaction.user.id) return interaction.reply({content:'Kendine tohum gönderemezsin!',ephemeral:true});
-    if (target.bot) return interaction.reply({content:'Botlara tohum gönderemezsin!',ephemeral:true});
+  const getData = (userId) => bahceler.get(userId) || {seviye: 0, plantTime: null, coin: 0};
+  const setData = (userId, data) => bahceler.set(userId, data);
+
+  // TOHUM
+  if (i.commandName === 'tohum') {
+    const target = i.options.getUser('kullanici');
+    if (target.id === i.user.id || target.bot) return i.reply({content:'Geçersiz hedef!',ephemeral:true});
 
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`kabul_${interaction.id}`).setLabel('✅ Kabul Et').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`red_${interaction.id}`).setLabel('❌ Reddet').setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId(`kabul_${i.id}`).setLabel('Kabul Et').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`red_${i.id}`).setLabel('Reddet').setStyle(ButtonStyle.Danger)
     );
 
-    await interaction.reply({
-      content: `<@${target.id}>, <@${interaction.user.id}> sana tohum gönderdi! Bahçen çimlenecek mi?`,
-      components: [row]
-    });
-    activeSeeds.set(interaction.id, {target: target.id, sender: interaction.user.id});
+    await i.reply({content:`<@${target.id}>, <@${i.user.id}> sana tohum gönderdi!`, components:[row]});
+    activeSeeds.set(i.id, {target: target.id});
   }
 
-  // BAHÇE GÖRÜNTÜLE
-  if (interaction.commandName === 'bahce') {
-    const data = await db.get(`bahce_${interaction.user.id}`) || {seviye: 0, plantTime: null, coin: 0};
-    let mesaj = '';
-
-    if (data.seviye === 1 && data.plantTime) {
-      const kalanMs = 7*24*60*60*1000 - (Date.now() - data.plantTime);
-      if (kalanMs <= 0) {
-        mesaj = '🍎 **Hasat hazır!** `/hasat` ile 100 coin kazan!';
-      } else {
-        const gün = Math.floor(kalanMs / (24*60*60*1000));
-        const saat = Math.floor((kalanMs % (24*60*60*1000)) / (60*60*1000));
-        mesaj = `🌱 Çimlendi! Kalan: ${gün} gün ${saat} saat`;
-      }
-    } else {
-      mesaj = '🌾 Bahçen boş. Birinden tohum iste!';
-    }
+  // BAHÇE
+  if (i.commandName === 'bahce') {
+    const data = getData(i.user.id);
+    let msg = data.seviye === 1 && data.plantTime ? 
+      (Date.now() - data.plantTime >= 7*24*60*60*1000 ? '🍎 Hasat hazır!' : `🌱 Çimlendi, biraz daha bekle...`) : 
+      '🌾 Bahçen boş!';
 
     const embed = new EmbedBuilder()
-      .setTitle(`${interaction.user.username}'ın Bahçesi`)
-      .setDescription(mesaj)
-      .addFields({ name: '💰 Coin', value: `${data.coin}`, inline: true })
-      .setColor(data.seviye === 1 ? 0x00ff00 : 0xff0000);
+      .setTitle(`${i.user.username}'ın Bahçesi`)
+      .setDescription(msg)
+      .addFields({name:'💰 Coin', value: `${data.coin}`})
+      .setColor(data.seviye === 1 ? 0x00ff00 : 0x888888);
 
-    await interaction.reply({embeds:[embed]});
+    await i.reply({embeds:[embed]});
   }
 
   // HASAT
-  if (interaction.commandName === 'hasat') {
-    const data = await db.get(`bahce_${interaction.user.id}`) || {seviye: 0, plantTime: null, coin: 0};
-    if (data.seviye !== 1 || !data.plantTime || Date.now() - data.plantTime < 7*24*60*60*1000) {
-      return interaction.reply({content:'❌ Henüz hasat zamanı gelmedi!',ephemeral:true});
+  if (i.commandName === 'hasat') {
+    const data = getData(i.user.id);
+    if (data.seviye !== 1 || Date.now() - data.plantTime < 7*24*60*60*1000) {
+      return i.reply({content:'Henüz hazır değil!',ephemeral:true});
     }
 
-    await db.set(`bahce_${interaction.user.id}`, {seviye: 0, plantTime: null, coin: data.coin + 100});
-
-    await interaction.reply(`🎉 **Hasat başarılı! +100 coin kazandın!**\nToplam coin: ${data.coin + 100}`);
+    setData(i.user.id, {seviye: 0, plantTime: null, coin: data.coin + 100});
+    await i.reply(`🎉 Hasat başarılı! +100 coin kazandın! Toplam: ${data.coin + 100}`);
   }
 
   // BUTONLAR
-  if (interaction.isButton()) {
-    const [islem, id] = interaction.customId.split('_');
+  if (i.isButton()) {
+    const [islem, id] = i.customId.split('_');
     const teklif = activeSeeds.get(id);
-    if (!teklif || interaction.user.id !== teklif.target) return;
+    if (!teklif || i.user.id !== teklif.target) return;
 
     if (islem === 'kabul') {
-      await db.set(`bahce_${interaction.user.id}`, {seviye: 1, plantTime: Date.now(), coin: (await db.get(`bahce_${interaction.user.id}`)?.coin || 0)});
-      
+      setData(i.user.id, {seviye: 1, plantTime: Date.now(), coin: getData(i.user.id).coin});
+
       const embed = new EmbedBuilder()
         .setTitle('🌟 Bahçe Çimlendi!')
-        .setDescription(`**${interaction.user.username}'ın bahçesi çimlendi!**\n1 hafta sonra hasat edebilirsin (+100 coin)`)
+        .setDescription(`**${i.user.username}'ın bahçesi çimlendi!**\n1 hafta sonra hasat edebilirsin (+100 coin)`)
         .setColor(0x32CD32);
 
-      await interaction.update({content: '', embeds: [embed], components: []});
+      await i.update({content:'', embeds:[embed], components:[]});
     } else {
-      await interaction.update({content: '❌ Tohum reddedildi, bahçe boş kaldı.', embeds: [], components: []});
+      await i.update({content:'❌ Tohum reddedildi.', embeds:[], components:[]});
     }
     activeSeeds.delete(id);
   }
